@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -28,7 +29,7 @@ func (s *Service) LogSnapshotAsync(table string, id any, action, actor string, d
 }
 
 func (s *Service) logSnapshot(table string, id any, action, actor string, data any) error {
-	auditTable := fmt.Sprintf("%s_audit", table)
+	auditTable := table
 
 	// Pastikan tabel audit ada
 	if err := s.ensureAuditTable(auditTable, data); err != nil {
@@ -85,8 +86,16 @@ func structToColumnsValues(data any) ([]string, []any) {
 
 	var cols []string
 	var vals []any
+
 	for i := 0; i < v.NumField(); i++ {
 		field := t.Field(i)
+
+		// ambil tag audit
+		auditTag := field.Tag.Get("audit")
+		if auditTag != "true" {
+			continue // skip kalau tidak true
+		}
+
 		tag := field.Tag.Get("json")
 		if tag == "" {
 			tag = strings.ToLower(field.Name)
@@ -94,8 +103,26 @@ func structToColumnsValues(data any) ([]string, []any) {
 		if tag == "-" {
 			continue
 		}
+
+		val := v.Field(i).Interface()
+		kind := v.Field(i).Kind()
+
+		switch kind {
+		case reflect.Struct:
+			if tm, ok := val.(time.Time); ok {
+				val = tm.Format("2006-01-02 15:04:05")
+			} else {
+				// skip nested struct yang bukan time.Time
+				continue
+			}
+		case reflect.Slice, reflect.Map:
+			b, _ := json.Marshal(val)
+			val = string(b)
+		}
+
 		cols = append(cols, tag)
-		vals = append(vals, v.Field(i).Interface())
+		vals = append(vals, val)
 	}
+
 	return cols, vals
 }
