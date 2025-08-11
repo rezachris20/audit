@@ -56,8 +56,7 @@ func (s *Service) ensureAuditTable(tableName string, data any) error {
 	err := s.auditDB.Get(&exists, `
 		SELECT COUNT(*) 
 		FROM information_schema.tables 
-		WHERE table_schema = DATABASE() 
-		AND table_name = ?`, tableName)
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
 	if err != nil {
 		return err
 	}
@@ -65,17 +64,89 @@ func (s *Service) ensureAuditTable(tableName string, data any) error {
 		return nil
 	}
 
-	// Ambil kolom & tipe dari struct
-	cols, types := structToColumnsAndTypes(data)
-	var ddlCols []string
-	for i, col := range cols {
-		ddlCols = append(ddlCols, fmt.Sprintf("`%s` %s", col, types[i]))
+	v := reflect.ValueOf(data)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
 	}
-	ddlCols = append(ddlCols, "`audit_action` VARCHAR(50)", "`audit_actor` VARCHAR(255)", "`audit_created_at` DATETIME")
+	t := v.Type()
+
+	var ddlCols []string
+	for i := 0; i < v.NumField(); i++ {
+		field := t.Field(i)
+
+		// cek audit tag
+		if field.Tag.Get("audit") != "true" {
+			continue
+		}
+
+		// ambil nama kolom
+		colName := ""
+		if gormTag := field.Tag.Get("gorm"); gormTag != "" {
+			for _, part := range strings.Split(gormTag, ";") {
+				partLower := strings.ToLower(part)
+				if strings.HasPrefix(partLower, "column:") {
+					colName = strings.TrimPrefix(part, "column:")
+				}
+			}
+		}
+		if colName == "" {
+			if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+				colName = jsonTag
+			} else {
+				colName = strings.ToLower(field.Name)
+			}
+		}
+
+		// ambil tipe kolom
+		sqlType := ""
+		if gormTag := field.Tag.Get("gorm"); gormTag != "" {
+			for _, part := range strings.Split(gormTag, ";") {
+				partLower := strings.ToLower(part)
+				if strings.HasPrefix(partLower, "type:") {
+					sqlType = strings.TrimPrefix(part, "type:")
+				}
+			}
+		}
+		if sqlType == "" {
+			sqlType = goTypeToSQLType(field.Type)
+		}
+
+		ddlCols = append(ddlCols, fmt.Sprintf("`%s` %s", colName, sqlType))
+	}
+
+	ddlCols = append(ddlCols,
+		"`audit_action` VARCHAR(50)",
+		"`audit_actor` VARCHAR(255)",
+		"`audit_created_at` DATETIME",
+	)
 
 	ddl := fmt.Sprintf("CREATE TABLE `%s` (%s)", tableName, strings.Join(ddlCols, ","))
 	_, err = s.auditDB.Exec(ddl)
 	return err
+}
+
+func goTypeToSQLType(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.String:
+		return "VARCHAR(255)"
+	case reflect.Bool:
+		return "BOOLEAN"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return "BIGINT"
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "BIGINT UNSIGNED"
+	case reflect.Float32, reflect.Float64:
+		return "DOUBLE"
+	case reflect.Struct:
+		if t == reflect.TypeOf(time.Time{}) {
+			return "DATETIME"
+		}
+		return "TEXT"
+	case reflect.Slice, reflect.Map:
+		return "JSON"
+	default:
+		return "TEXT"
+	}
 }
 
 // structToColumnsAndTypes: ambil kolom & tipe data dari tag gorm
