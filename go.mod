@@ -1,4 +1,4 @@
-module audit
+module github.com/rezachris20/audit
 
 go 1.23.3
 
