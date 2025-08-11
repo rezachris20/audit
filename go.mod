@@ -1,4 +1,4 @@
-module go-audit
+module audit
 
 go 1.23.3
 
