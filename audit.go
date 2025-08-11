@@ -43,11 +43,9 @@ func (s *Service) logSnapshot(table string, id any, action, actor string, data a
 
 	// Build query INSERT
 	colNames := "`" + strings.Join(columns, "`, `") + "`"
-	placeholders := strings.Repeat("?,", len(columns))
-	placeholders = strings.TrimRight(placeholders, ",")
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(columns)), ",")
 
 	query := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)", auditTable, colNames, placeholders)
-
 	_, err := s.auditDB.Exec(query, values...)
 	return err
 }
@@ -55,7 +53,11 @@ func (s *Service) logSnapshot(table string, id any, action, actor string, data a
 func (s *Service) ensureAuditTable(tableName string, data any) error {
 	// Cek apakah table sudah ada
 	var exists int
-	err := s.auditDB.Get(&exists, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", tableName)
+	err := s.auditDB.Get(&exists, `
+		SELECT COUNT(*) 
+		FROM information_schema.tables 
+		WHERE table_schema = DATABASE() 
+		AND table_name = ?`, tableName)
 	if err != nil {
 		return err
 	}
@@ -63,11 +65,11 @@ func (s *Service) ensureAuditTable(tableName string, data any) error {
 		return nil
 	}
 
-	// Buat DDL berdasarkan struct data
-	columns, _ := structToColumnsValues(data)
+	// Ambil kolom & tipe dari struct
+	cols, types := structToColumnsAndTypes(data)
 	var ddlCols []string
-	for _, col := range columns {
-		ddlCols = append(ddlCols, fmt.Sprintf("`%s` TEXT", col))
+	for i, col := range cols {
+		ddlCols = append(ddlCols, fmt.Sprintf("`%s` %s", col, types[i]))
 	}
 	ddlCols = append(ddlCols, "`audit_action` VARCHAR(50)", "`audit_actor` VARCHAR(255)", "`audit_created_at` DATETIME")
 
@@ -76,7 +78,61 @@ func (s *Service) ensureAuditTable(tableName string, data any) error {
 	return err
 }
 
-// structToColumnsValues mengubah struct menjadi slice kolom & nilai
+// structToColumnsAndTypes: ambil kolom & tipe data dari tag gorm
+func structToColumnsAndTypes(data any) ([]string, []string) {
+	v := reflect.ValueOf(data)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	t := v.Type()
+
+	var cols []string
+	var types []string
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.Tag.Get("audit") != "true" {
+			continue
+		}
+
+		// Ambil nama kolom
+		colName := parseColumnName(field)
+
+		// Default tipe TEXT
+		colType := "TEXT"
+		if gormTag := field.Tag.Get("gorm"); gormTag != "" {
+			for _, part := range strings.Split(gormTag, ";") {
+				partLower := strings.ToLower(part)
+				if strings.Contains(partLower, "type:") {
+					colType = strings.TrimPrefix(part, "type:")
+				} else if strings.Contains(partLower, "varchar") ||
+					strings.Contains(partLower, "datetime") ||
+					strings.Contains(partLower, "boolean") {
+					colType = part
+				}
+			}
+		} else {
+			// Auto detect tipe kalau gorm type tidak ada
+			switch field.Type.Kind() {
+			case reflect.String:
+				colType = "TEXT"
+			case reflect.Int, reflect.Int64, reflect.Uint, reflect.Uint64:
+				colType = "BIGINT"
+			case reflect.Bool:
+				colType = "BOOLEAN"
+			default:
+				if field.Type == reflect.TypeOf(time.Time{}) {
+					colType = "DATETIME"
+				}
+			}
+		}
+
+		cols = append(cols, colName)
+		types = append(types, colType)
+	}
+	return cols, types
+}
+
 func structToColumnsValues(data any) ([]string, []any) {
 	v := reflect.ValueOf(data)
 	if v.Kind() == reflect.Ptr {
@@ -89,36 +145,15 @@ func structToColumnsValues(data any) ([]string, []any) {
 
 	for i := 0; i < v.NumField(); i++ {
 		field := t.Field(i)
-
-		// ambil tag audit
-		auditTag := field.Tag.Get("audit")
-		if auditTag != "true" {
+		if field.Tag.Get("audit") != "true" {
 			continue
 		}
 
-		// Ambil nama kolom dari gorm:"column:..."
-		colName := ""
-		if gormTag := field.Tag.Get("gorm"); gormTag != "" {
-			for _, part := range strings.Split(gormTag, ";") {
-				if strings.HasPrefix(strings.ToLower(part), "column:") {
-					colName = strings.TrimPrefix(part, "column:")
-				}
-			}
-		}
-
-		// Kalau tidak ada, ambil dari json
-		if colName == "" {
-			if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
-				colName = jsonTag
-			} else {
-				colName = strings.ToLower(field.Name)
-			}
-		}
-
+		colName := parseColumnName(field)
 		valField := v.Field(i)
 		val := valField.Interface()
 
-		// Null & pointer handling
+		// Handle pointer
 		if valField.Kind() == reflect.Ptr {
 			if valField.IsNil() {
 				val = nil
@@ -134,11 +169,17 @@ func structToColumnsValues(data any) ([]string, []any) {
 			} else {
 				val = realVal.Format("2006-01-02 15:04:05")
 			}
+		case string:
+			if realVal == "" {
+				val = nil
+			}
 		default:
 			rv := reflect.ValueOf(val)
 			if rv.Kind() == reflect.Struct {
-				// Skip nested struct yang bukan time.Time
-				continue
+				// Skip nested struct non-time
+				if _, ok := val.(time.Time); !ok {
+					continue
+				}
 			}
 			if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map {
 				b, _ := json.Marshal(val)
@@ -151,4 +192,19 @@ func structToColumnsValues(data any) ([]string, []any) {
 	}
 
 	return cols, vals
+}
+
+func parseColumnName(field reflect.StructField) string {
+	// Prioritas: gorm:column -> json -> nama field lowercase
+	if gormTag := field.Tag.Get("gorm"); gormTag != "" {
+		for _, part := range strings.Split(gormTag, ";") {
+			if strings.HasPrefix(strings.ToLower(part), "column:") {
+				return strings.TrimPrefix(part, "column:")
+			}
+		}
+	}
+	if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+		return strings.Split(jsonTag, ",")[0]
+	}
+	return strings.ToLower(field.Name)
 }
