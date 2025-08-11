@@ -93,34 +93,60 @@ func structToColumnsValues(data any) ([]string, []any) {
 		// ambil tag audit
 		auditTag := field.Tag.Get("audit")
 		if auditTag != "true" {
-			continue // skip kalau tidak true
-		}
-
-		tag := field.Tag.Get("json")
-		if tag == "" {
-			tag = strings.ToLower(field.Name)
-		}
-		if tag == "-" {
 			continue
 		}
 
-		val := v.Field(i).Interface()
-		kind := v.Field(i).Kind()
-
-		switch kind {
-		case reflect.Struct:
-			if tm, ok := val.(time.Time); ok {
-				val = tm.Format("2006-01-02 15:04:05")
-			} else {
-				// skip nested struct yang bukan time.Time
-				continue
+		// Ambil nama kolom dari gorm:"column:..."
+		colName := ""
+		if gormTag := field.Tag.Get("gorm"); gormTag != "" {
+			for _, part := range strings.Split(gormTag, ";") {
+				if strings.HasPrefix(strings.ToLower(part), "column:") {
+					colName = strings.TrimPrefix(part, "column:")
+				}
 			}
-		case reflect.Slice, reflect.Map:
-			b, _ := json.Marshal(val)
-			val = string(b)
 		}
 
-		cols = append(cols, tag)
+		// Kalau tidak ada, ambil dari json
+		if colName == "" {
+			if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+				colName = jsonTag
+			} else {
+				colName = strings.ToLower(field.Name)
+			}
+		}
+
+		valField := v.Field(i)
+		val := valField.Interface()
+
+		// Null & pointer handling
+		if valField.Kind() == reflect.Ptr {
+			if valField.IsNil() {
+				val = nil
+			} else {
+				val = valField.Elem().Interface()
+			}
+		}
+
+		switch realVal := val.(type) {
+		case time.Time:
+			if realVal.IsZero() {
+				val = nil
+			} else {
+				val = realVal.Format("2006-01-02 15:04:05")
+			}
+		default:
+			rv := reflect.ValueOf(val)
+			if rv.Kind() == reflect.Struct {
+				// Skip nested struct yang bukan time.Time
+				continue
+			}
+			if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map {
+				b, _ := json.Marshal(val)
+				val = string(b)
+			}
+		}
+
+		cols = append(cols, colName)
 		vals = append(vals, val)
 	}
 
