@@ -11,4 +11,4 @@ Audit trail akan disimpan di database terpisah, dan jika tabel audit belum ada, 
 
 ## 📦 Instalasi
 ```bash
-go get gitlab.ptmjl.com/packages/audit
+go get github.com/rezachris20/go-audit
